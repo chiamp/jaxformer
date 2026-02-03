@@ -1,10 +1,12 @@
 import json
 import pickle
 
+import time
+
 import jax.numpy as jnp
 
 from data import load_data
-from inference import make_teacher_force_forward_fn, make_autoregressive_encode_decode_fn
+from inference import make_teacher_force_forward_fn, make_autoregressive_encode_decode_fn, make_autoregressive_encode_decode_with_kv_cache_fn
 from train import Config, get_config
 from visualize_attention import plot_attention_grid
 
@@ -67,20 +69,25 @@ def eval_autoregressive_decoding(config: Config, file_name: str):
   with open(f'checkpoints/{config.task}/{file_name}.pkl', 'rb') as file:
     learned_params = pickle.load(file)
 
-  autoregressive_encode_decode = make_autoregressive_encode_decode_fn(config)
+  for str_label, autoregressive_encode_decode_fn in (
+    ('without kv cache', make_autoregressive_encode_decode_fn(config)),
+    ('with kv cache', make_autoregressive_encode_decode_with_kv_cache_fn(config)),
+  ):
+    start_time = time.time()
+    # output array is of shape # (batch, sequence-1)
+    output_array, attention_scores_dict = autoregressive_encode_decode_fn(learned_params, input_data)
+    print(f'Done decoding in {time.time() - start_time} seconds.')
 
-  # output array is of shape # (batch, sequence)
-  output_array, attention_scores_dict = autoregressive_encode_decode(learned_params, input_data)
-
-  print('Decoded output sequences:')
-  for i in range(output_array.shape[0]):
-    output_sequence = config.tokenizer.decode(output_array[i, :].tolist())
-    start = output_sequence.index(config.tokenizer.SOS) if (config.tokenizer.SOS in output_sequence) else -1
-    end = output_sequence.index(config.tokenizer.EOS) if (config.tokenizer.EOS in output_sequence) else None
-    if end is None:
-      print(output_sequence[start+1:])
-    else:
-      print(output_sequence[start+1:end])
+    print(f'Decoded output sequences {str_label}:')
+    for i in range(output_array.shape[0]):
+      output_sequence = config.tokenizer.decode(output_array[i, :].tolist())
+      start = output_sequence.index(config.tokenizer.SOS) if (config.tokenizer.SOS in output_sequence) else -1
+      end = output_sequence.index(config.tokenizer.EOS) if (config.tokenizer.EOS in output_sequence) else None
+      if end is None:
+        print(output_sequence[start+1:])
+      else:
+        print(output_sequence[start+1:end])
+    print()
 
   # plot_attention_grid(
   #   attention_scores_dict,
@@ -94,10 +101,10 @@ def eval_autoregressive_decoding(config: Config, file_name: str):
 
 if __name__ == '__main__':
   task = 'string_reverse'
-  file_name = '1768953091_9877179'
+  file_name = '1770142654_4459379'
 
   # task = 'addition'
-  # file_name = '1769045003_081548'
+  # file_name = '1770143050_624529'
 
   config = get_config(task)
 

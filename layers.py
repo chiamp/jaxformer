@@ -2,6 +2,8 @@
 Attention is all you need paper: https://arxiv.org/pdf/1706.03762
 
 Comments about dimension/shape:
+- v: vocabulary size
+- layer: number of layers in the encoder or decoder
 - batch: each entry in the batch is a separate input sentence
 - sequence: each entry is a token (e.g. character, word, etc.) that makes up the sentence
   - e.g. (3, 4) in a (batch, sequence) matrix represents the 4th token in the 3rd input sentence sample
@@ -22,6 +24,17 @@ import jax
 import jax.numpy as jnp
 
 
+def position_encode_single(index: int, num_embedding_features: int) -> jax.Array:
+  embedding_feature_vector = (jnp.arange(num_embedding_features) // 2) * 2  # vector [0, 0, 2, 2, 4, 4, ...], of shape (d_model,)
+
+  positional_embeddings = index / (10000**(embedding_feature_vector/num_embedding_features))
+  positional_embeddings = positional_embeddings[None, :] # shape (1, d_model)
+
+  positional_embeddings = positional_embeddings.at[:,::2].set(jnp.sin(positional_embeddings[:,::2]))
+  positional_embeddings = positional_embeddings.at[:,1::2].set(jnp.cos(positional_embeddings[:,1::2]))
+
+  return positional_embeddings  # (1, d_model)
+
 def position_encode(sequence_length: int, num_embedding_features: int) -> jax.Array:
   position_vector = jnp.arange(sequence_length)  # (sequence,)
   embedding_feature_vector = (jnp.arange(num_embedding_features) // 2) * 2  # vector [0, 0, 2, 2, 4, 4, ...], of shape (d_model,)
@@ -37,10 +50,16 @@ def position_encode(sequence_length: int, num_embedding_features: int) -> jax.Ar
   return positional_embeddings  # (sequence, d_model)
 
 
-def get_causal_mask(sequence_length: int) -> jax.Array:
+def get_1d_causal_mask(sequence_length: int, index: int) -> jax.Array:
+  mask = jnp.arange(sequence_length)
+  # Insert dummy dimension since the first dimension represents the sequence_q dimension,
+  # which would be a single token if we were using kv cache.
+  return jnp.where(mask > index, -1e9, 0)[None, :]  # (1, sequence_k)
+
+def get_2d_causal_mask(sequence_length: int) -> jax.Array:
   # Upper triangle mask (NOTE: the diagonal is not masked).
   mask = jnp.ones((sequence_length, sequence_length))
-  return jnp.triu(mask, k=1) * (-1e9)  # (sequence, sequence)
+  return jnp.triu(mask, k=1) * (-1e9)  # (sequence_q, sequence_k)
 
 
 def project_attention(x: jax.Array, attention_matrix: jax.Array, *, num_heads: int, num_query_key_value_features: int) -> jax.Array:
@@ -64,8 +83,8 @@ def compute_attention_output(
     *,
     num_query_key_features: int,
     num_embedding_features: int,
-    padding_mask: jax.Array,
-    apply_causal_mask: bool,
+    padding_mask: jax.Array | None,
+    causal_mask: jax.Array | None,
 ) -> tuple[jax.Array, jax.Array]:
   # x is of shape (batch, sequence, d_model)
   # q_proj is of shape (batch, head, sequence_q, d_k)
@@ -82,12 +101,10 @@ def compute_attention_output(
   # Calculate QK_T attention scores
   k_proj = jnp.einsum('bhsk->bhks', k_proj)  # (batch, head, d_k, sequence_k)
   attention_scores = jnp.einsum('bhid,bhdo->bhio', q_proj, k_proj) / jnp.sqrt(num_query_key_features)  # (batch, head, sequence_q, sequence_k)
-  attention_scores += padding_mask[:, None, None, :]  # add dummy dimensions to padding mask (batch, 1, 1, sequence_k) and apply it
-  if apply_causal_mask:
-    # Apply causal mask.
-    # Note this function returns a square causal mask to be applied to the attention score matrix, so we assume the attention score matrix is square.
-    # The only time the attention score matrix is not a square is during cross attention, but we do not apply a causal mask for cross attention anyways.
-    attention_scores += get_causal_mask(sequence_length=sequence_length)[None, None, :, :]  # (1, 1, sequence, sequence)
+  if padding_mask is not None:  # apply padding mask (only used in encoder attention layers and cross attention layers in the decoder)
+    attention_scores += padding_mask[:, None, None, :]  # add dummy dimensions to padding mask (batch, 1, 1, sequence_k) and apply it
+  if causal_mask is not None:  # apply causal mask (used only in masked attention layers in the decoder)
+    attention_scores += causal_mask[None, None, :, :]  # (1, 1, sequence, sequence)
   attention_scores = jax.nn.softmax(attention_scores)  # softmax over the last dimension
 
   # Calculate (Q_KT) @ V attention weighted sum output
@@ -164,17 +181,13 @@ def encoder_single_layer(
   )  # (batch, head, sequence, d_v)
 
   # Compute attention output
-  x, attention_scores = compute_attention_output(
-    x,
-    q_proj,
-    k_proj,
-    v_proj,
-    encoder_params['attention'],
+  x, attention_scores = functools.partial(
+    compute_attention_output,
     num_query_key_features=num_query_key_features,
     num_embedding_features=num_embedding_features,
     padding_mask=padding_mask,
-    apply_causal_mask=False,
-  )  # (batch, sequence, d_model)
+    causal_mask=None,
+  )(x, q_proj, k_proj, v_proj, encoder_params['attention'])  # (batch, sequence, d_model)
 
   # Compute dense output
   x = compute_dense_output(x, encoder_params['dense'])  # (batch, sequence, d_model)
@@ -188,7 +201,6 @@ def decoder_single_layer(
     decoder_params: dict[str, dict[str, jax.Array]],
     *,
     encoder_output: jax.Array,
-    masked_padding_mask: jax.Array,
     cross_padding_mask: jax.Array,
     num_heads: int,
     num_query_key_features: int,
@@ -196,6 +208,7 @@ def decoder_single_layer(
     num_embedding_features: int,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
   # Single pass of one decoder layer: masked_attention -> layernorm -> cross_attention -> layernorm -> dense -> layernorm
+  # x is of shape (batch, sequence, d_model)
 
   # Project attention matrices
   q_proj = project_attention(
@@ -218,17 +231,13 @@ def decoder_single_layer(
   )  # (batch, head, sequence, d_v)
 
   # Compute masked attention output
-  x, masked_attention_scores = compute_attention_output(
-    x,
-    q_proj,
-    k_proj,
-    v_proj,
-    decoder_params['masked_attention'],
+  x, masked_attention_scores = functools.partial(
+    compute_attention_output,
     num_query_key_features=num_query_key_features,
     num_embedding_features=num_embedding_features,
-    padding_mask=masked_padding_mask,  # (batch, sequence-1), derived from input sentence batch to decoder
-    apply_causal_mask=True,
-  )  # (batch, sequence, d_model)
+    padding_mask=None,  # causal mask will already mask out future tokens, so padding mask is not needed.
+    causal_mask=get_2d_causal_mask(sequence_length=x.shape[1]),
+  )(x, q_proj, k_proj, v_proj, decoder_params['masked_attention'])  # (batch, sequence, d_model)
 
   # Project cross attention matrices
   q_proj = project_attention(
@@ -251,17 +260,13 @@ def decoder_single_layer(
   )  # (batch, head, sequence, d_v)
 
   # Compute cross attention output
-  x, cross_attention_scores = compute_attention_output(
-    x,
-    q_proj,
-    k_proj,
-    v_proj,
-    decoder_params['cross_attention'],
+  x, cross_attention_scores = functools.partial(
+    compute_attention_output,
     num_query_key_features=num_query_key_features,
     num_embedding_features=num_embedding_features,
     padding_mask=cross_padding_mask,  # (batch, sequence), derived from input sentence batch to encoder
-    apply_causal_mask=False,
-  )  # (batch, sequence, d_model)
+    causal_mask=None,
+  )(x, q_proj, k_proj, v_proj, decoder_params['cross_attention'])  # (batch, sequence, d_model)
 
   # Compute dense output
   x = compute_dense_output(x, decoder_params['dense'])  # (batch, sequence, d_model)
@@ -270,6 +275,100 @@ def decoder_single_layer(
     'masked_attention_scores': masked_attention_scores,  # (batch, head, sequence, sequence)
     'cross_attention_scores': cross_attention_scores,  # (batch, head, sequence, sequence)
   }
+
+
+def decoder_single_layer_with_kv_cache(
+    x: jax.Array,
+    decoder_params_and_kv_cache_and_projs: tuple[dict[str, dict[str, jax.Array]], dict[str, jax.Array], jax.Array, jax.Array],
+    *,
+    cross_padding_mask: jax.Array,
+    index: int,
+    num_heads: int,
+    num_query_key_features: int,
+    num_value_features: int,
+    num_embedding_features: int,
+) -> tuple[jax.Array, tuple[dict[str, jax.Array], dict[str, jax.Array]]]:
+  # Single pass of one decoder layer: masked_attention -> layernorm -> cross_attention -> layernorm -> dense -> layernorm
+  # x is of shape (batch, 1, d_model)
+
+  # kv_cache and projection arrays are of shape (batch, head, sequence, d_k or d_v)
+  decoder_params, kv_cache, cross_k_proj, cross_v_proj = decoder_params_and_kv_cache_and_projs
+  max_sequence_length = cross_k_proj.shape[2]
+
+  # Project attention matrices
+  q_proj_vector = project_attention(
+    x,
+    decoder_params['masked_attention']['query'],
+    num_heads=num_heads,
+    num_query_key_value_features=num_query_key_features,
+  )  # (batch, head, 1, d_k)
+  k_proj_vector = project_attention(
+    x,
+    decoder_params['masked_attention']['key'],
+    num_heads=num_heads,
+    num_query_key_value_features=num_query_key_features,
+  )  # (batch, head, 1, d_k)
+  v_proj_vector = project_attention(
+    x,
+    decoder_params['masked_attention']['value'],
+    num_heads=num_heads,
+    num_query_key_value_features=num_value_features,
+  )  # (batch, head, 1, d_v)
+
+  # Load the KV cache
+  k_proj = kv_cache['key_cache']  # (batch, head, sequence, d_k)
+  v_proj = kv_cache['value_cache']  # (batch, head, sequence, d_v)
+
+  # Update the KV cache with the most recently computed key and value projections for the current input token / time step
+  k_proj = k_proj.at[:, :, index, :].set(k_proj_vector[:, :, 0, :])  # match (batch, head, d_k) dimensions
+  v_proj = v_proj.at[:, :, index, :].set(v_proj_vector[:, :, 0, :])
+  kv_cache['key_cache'] = k_proj
+  kv_cache['value_cache'] = v_proj
+
+  # Compute masked attention output
+  x, masked_attention_scores = functools.partial(
+    compute_attention_output,
+    num_query_key_features=num_query_key_features,
+    num_embedding_features=num_embedding_features,
+    padding_mask=None,
+    causal_mask=get_1d_causal_mask(sequence_length=max_sequence_length, index=index),
+  )(x, q_proj_vector, k_proj, v_proj, decoder_params['masked_attention'])  # (batch, 1, d_model)
+  # k_proj and v_proj are of shapes (batch, head, sequence, d_k) and (batch, head, sequence, d_v), respectively
+
+  # Project cross attention matrices
+  q_proj = project_attention(
+    x,
+    decoder_params['cross_attention']['query'],
+    num_heads=num_heads,
+    num_query_key_value_features=num_query_key_features,
+  )  # (batch, head, 1, d_k)
+  # Cross attention projection for key and value are dependent on the encoder output.
+  # Since the encoder output is static (i.e. processed once in the beginning),
+  # there is no need to re-compute the cross attention projection key and value every time we run the decoder auto-regressively.
+
+  # Compute cross attention output
+  x, cross_attention_scores = functools.partial(
+    compute_attention_output,
+    num_query_key_features=num_query_key_features,
+    num_embedding_features=num_embedding_features,
+    padding_mask=cross_padding_mask,  # (batch, sequence), derived from input sentence batch to encoder
+    causal_mask=None,
+  )(x, q_proj, cross_k_proj, cross_v_proj, decoder_params['cross_attention'])  # (batch, 1, d_model)
+  # cross_k_proj and cross_v_proj are of shapes (batch, head, sequence, d_k) and (batch, head, sequence, d_v), respectively
+
+  # Compute dense output
+  x = compute_dense_output(x, decoder_params['dense'])  # (batch, 1, d_model)
+
+  return (
+    x,
+    (
+      kv_cache,
+      {
+        'masked_attention_scores': masked_attention_scores,  # (batch, head, sequence, sequence)
+        'cross_attention_scores': cross_attention_scores,  # (batch, head, sequence, sequence)
+      },
+    ),
+  )
 
 
 def encoder_forward(
@@ -289,7 +388,7 @@ def encoder_forward(
 
   # Embedding and position encoding
   x = params['embedding'][x] * jnp.sqrt(num_embedding_features) # (batch, sequence, d_model)
-  x += position_encode(sequence_length=sequence_length, num_embedding_features=num_embedding_features)
+  x += position_encode(sequence_length=sequence_length, num_embedding_features=num_embedding_features)[None, :, :]
 
   # Apply a loop of encoder layer forward passes
   x, attention_scores = jax.lax.scan(
@@ -313,7 +412,6 @@ def decoder_forward(
     params: dict,
     *,
     encoder_output: jax.Array,
-    masked_padding_mask: jax.Array,
     cross_padding_mask: jax.Array,
     num_heads: int,
     num_query_key_features: int,
@@ -328,14 +426,13 @@ def decoder_forward(
   # Embedding and position encoding
   embedding_matrix: jax.Array = params['embedding']  # (vocab, d_model)
   x = embedding_matrix[x] * jnp.sqrt(num_embedding_features) # (batch, sequence, d_model)
-  x += position_encode(sequence_length=sequence_length, num_embedding_features=num_embedding_features)
+  x += position_encode(sequence_length=sequence_length, num_embedding_features=num_embedding_features)[None, :, :]
 
   # Apply a loop of encoder layer forward passes
   x, attention_scores_dict = jax.lax.scan(
     functools.partial(
       decoder_single_layer,
       encoder_output=encoder_output,
-      masked_padding_mask=masked_padding_mask,
       cross_padding_mask=cross_padding_mask,
       num_heads=num_heads,
       num_query_key_features=num_query_key_features,
@@ -351,3 +448,48 @@ def decoder_forward(
 
   # return raw logits, do softmax/hardmax in an outer function
   return x, attention_scores_dict
+
+
+def decoder_forward_with_kv_cache(
+    x: jax.Array,  # array of token indices
+    params_and_kv_cache: tuple[dict, dict[str, jax.Array]],
+    *,
+    cross_k_proj: jax.Array,
+    cross_v_proj: jax.Array,
+    cross_padding_mask: jax.Array,
+    index: int,
+    num_heads: int,
+    num_query_key_features: int,
+    num_value_features: int,
+    num_embedding_features: int,
+) -> tuple[jax.Array, tuple[dict[str, jax.Array], dict[str, jax.Array]]]:
+  # Forward pass of all layers in the decoder stack
+  # x is of shape (batch, 1)
+
+  params, kv_cache = params_and_kv_cache  # kv_cache arrays are of shape (layer, batch, head, sequence, d_k or d_v)
+
+  # Embedding and position encoding
+  embedding_matrix: jax.Array = params['embedding']  # (vocab, d_model)
+  x = embedding_matrix[x] * jnp.sqrt(num_embedding_features) # (batch, 1, d_model)
+  x += position_encode_single(index=index, num_embedding_features=num_embedding_features)
+
+  # Apply a loop of encoder layer forward passes
+  x, (new_kv_cache, attention_scores_dict) = jax.lax.scan(
+    functools.partial(
+      decoder_single_layer_with_kv_cache,
+      cross_padding_mask=cross_padding_mask,
+      index=index,
+      num_heads=num_heads,
+      num_query_key_features=num_query_key_features,
+      num_value_features=num_value_features,
+      num_embedding_features=num_embedding_features,
+    ),
+    x,
+    (params['decoder'], kv_cache, cross_k_proj, cross_v_proj),
+  )  # (batch, 1, d_model)
+
+  # Project embeddings back to vocab
+  x = jnp.einsum('bsd,dv->bsv', x, embedding_matrix.T) + params['final_bias'][None, None, :]  # (batch, 1, vocab)
+
+  # return raw logits, do softmax/hardmax in an outer function
+  return x, (new_kv_cache, attention_scores_dict)
