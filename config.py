@@ -58,9 +58,13 @@ class Config:
   def pad_index(self) -> int:
     return self.tokenizer.PAD_INDEX
 
+  @functools.cached_property
+  def sep_index(self) -> int:
+    return self.tokenizer.SEP_INDEX
 
-STRING_REVERSE_CONFIG = Config(
-  task='string_reverse',
+
+STRING_REVERSE_ENCODER_DECODER_CONFIG = Config(
+  task='string_reverse_encoder_decoder',
   batch_size=64,
   train_split_ratio=0.9,
   lr_schedule = optax.warmup_cosine_decay_schedule(
@@ -69,6 +73,57 @@ STRING_REVERSE_CONFIG = Config(
     warmup_steps=400,
     decay_steps=3500,
     end_value=1e-6,
+  ),
+  validation_loss_cutoff=0.03,
+  max_num_train_epochs=None,
+  max_patience=50,
+  eval_every_n_epochs=20,
+  num_embedding_features=128,
+  num_query_key_features=64,
+  num_value_features=64,
+  num_heads=2,
+  num_inner_dense_features=2048,
+  num_encoder_layers=2,
+  num_decoder_layers=2,
+  seed=0,
+)
+
+STRING_REVERSE_DECODER_ONLY_CONFIG = Config(
+  task='string_reverse_decoder_only',
+  batch_size=64,
+  train_split_ratio=0.9,
+  lr_schedule = optax.warmup_cosine_decay_schedule(
+    init_value=3e-4,
+    peak_value=3e-4,
+    warmup_steps=400,
+    decay_steps=3500,
+    end_value=1e-6,
+  ),
+  validation_loss_cutoff=0.03,
+  max_num_train_epochs=None,
+  max_patience=100,
+  eval_every_n_epochs=20,
+  num_embedding_features=128,
+  num_query_key_features=64,
+  num_value_features=64,
+  num_heads=2,
+  num_inner_dense_features=2048,
+  num_encoder_layers=2,
+  num_decoder_layers=2,
+  seed=0,
+)
+
+
+ADDITION_ENCODER_DECODER_CONFIG = Config(
+  task='addition_encoder_decoder',
+  batch_size=64,
+  train_split_ratio=0.9,
+  lr_schedule = optax.warmup_cosine_decay_schedule(
+    init_value=3e-4,
+    peak_value=3e-4,
+    warmup_steps=1600,
+    decay_steps=5000,
+    end_value=1e-5,
   ),
   validation_loss_cutoff=0.03,
   max_num_train_epochs=None,
@@ -84,21 +139,21 @@ STRING_REVERSE_CONFIG = Config(
   seed=0,
 )
 
-
-ADDITION_CONFIG = Config(
-  task='addition',
+ADDITION_DECODER_ONLY_CONFIG = Config(
+  task='addition_decoder_only',
   batch_size=64,
   train_split_ratio=0.9,
   lr_schedule = optax.warmup_cosine_decay_schedule(
-    init_value=3e-4,
-    peak_value=3e-4,
+    init_value=1e-3,
+    peak_value=1e-3,
     warmup_steps=1600,
-    decay_steps=5000,
-    end_value=1e-6,
+    # decay_steps=5000,
+    decay_steps=15000,
+    end_value=5e-5,
   ),
   validation_loss_cutoff=0.03,
   max_num_train_epochs=None,
-  max_patience=20,
+  max_patience=1000,
   eval_every_n_epochs=20,
   num_embedding_features=128,
   num_query_key_features=64,
@@ -113,9 +168,13 @@ ADDITION_CONFIG = Config(
 
 def get_config(task: str) -> Config:
   match task:
-    case 'string_reverse':
-      return STRING_REVERSE_CONFIG
-    case 'addition':
-      return ADDITION_CONFIG
+    case 'string_reverse_encoder_decoder':
+      return STRING_REVERSE_ENCODER_DECODER_CONFIG
+    case 'string_reverse_decoder_only':
+      return STRING_REVERSE_DECODER_ONLY_CONFIG
+    case 'addition_encoder_decoder':
+      return ADDITION_ENCODER_DECODER_CONFIG
+    case 'addition_decoder_only':
+      return ADDITION_DECODER_ONLY_CONFIG
     case _:
       raise ValueError(f'Unknown task {task}')

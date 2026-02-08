@@ -12,27 +12,29 @@ import jax.numpy as jnp
 from tokenizer import get_tokenizer
 
 
-def generate_string_reverse_data(
+def generate_string_reverse_encoder_decoder_data(
     min_length=1,
-    max_length=10,
+    max_length=8,  # max length of input word
     n_samples=1e4,
 ):
-  data_path = 'data/string_reverse'
+  data_path = 'data/string_reverse_encoder_decoder'
   if not os.path.exists(data_path):
     os.mkdir(data_path)
 
-  tokenizer = get_tokenizer('string_reverse')
+  tokenizer = get_tokenizer('string_reverse_encoder_decoder')
+
+  max_sequence_length = max_length + 2  # make room for SOS and EOS tokens
 
   words: list[str] = []
   reverse_words: list[str] = []
   tokenized_words: list[list[int]] = []
   tokenized_reverse_words: list[list[int]] = []
   for _ in tqdm.tqdm(range(int(n_samples)), desc='Generating string reverse data'):
-    length = random.randint(min_length, max_length-2)  # make room for SOS and EOS tokens
+    length = random.randint(min_length, max_length)
     word = ''.join(chr(random.randint(97, 122)) for _ in range(length))
 
     # Add SOS, EOS and padding tokens to make it fixed length of max_length
-    padding = tokenizer.PAD * (max_length - len(word) - 2)
+    padding = tokenizer.PAD * (max_sequence_length - len(word) - 2)
     reverse_word = tokenizer.SOS + word[::-1] + tokenizer.EOS + padding
     word = tokenizer.SOS + word + tokenizer.EOS + padding
 
@@ -50,7 +52,44 @@ def generate_string_reverse_data(
   with open(f'{data_path}/vocab_size.json', 'w') as file:
     json.dump(tokenizer.VOCAB_SIZE, file)
   with open(f'{data_path}/max_sequence_length.json', 'w') as file:
-    json.dump(max_length, file)
+    json.dump(max_sequence_length, file)  # make room for SOS and EOS tokens
+
+def generate_string_reverse_decoder_only_data(
+    min_length=1,
+    max_length=8,  # max length of input+reversed word
+    n_samples=1e4,
+):
+  data_path = 'data/string_reverse_decoder_only'
+  if not os.path.exists(data_path):
+    os.mkdir(data_path)
+
+  tokenizer = get_tokenizer('string_reverse_decoder_only')
+
+  max_sequence_length = max_length*2 + 3  # make room for SOS, EOS and SEP tokens
+
+  words: list[str] = []
+  # reverse_words: list[str] = []
+  tokenized_words: list[list[int]] = []
+  # tokenized_reverse_words: list[list[int]] = []
+  for _ in tqdm.tqdm(range(int(n_samples)), desc='Generating string reverse data'):
+    length = random.randint(min_length, max_length)
+    word = ''.join(chr(random.randint(97, 122)) for _ in range(length))
+    word = tokenizer.SOS + word + tokenizer.SEP + word[::-1] + tokenizer.EOS  # add the correct "response"/answer
+
+    # Add padding tokens to make it fixed length of max_sequence_length
+    padding = tokenizer.PAD * (max_sequence_length - len(word))
+    word += padding
+
+    words.append(word)
+    tokenized_words.append(tokenizer.encode(word))
+
+  with open(f'{data_path}/input.json', 'w') as file:
+    json.dump(words, file, indent=2)
+  np.save(f'{data_path}/tokenized_input.npy', np.array(tokenized_words, dtype=np.int16))
+  with open(f'{data_path}/vocab_size.json', 'w') as file:
+    json.dump(tokenizer.VOCAB_SIZE, file)
+  with open(f'{data_path}/max_sequence_length.json', 'w') as file:
+    json.dump(max_sequence_length, file)
 
 
 def _generate_number(length: int, allow_leading_zero=False) -> str:
@@ -79,16 +118,16 @@ def _generate_carry_chain_number(length: int, carry_chain_length: int) -> str:
   )
 
 
-def generate_addition_data(
+def generate_addition_encoder_decoder_data(
     min_length=1,
-    max_length=5,
+    max_length=5,  # max length of operand
     n_samples=5e4,
 ):
-  data_path = 'data/addition'
+  data_path = 'data/addition_encoder_decoder'
   if not os.path.exists(data_path):
     os.mkdir(data_path)
 
-  tokenizer = get_tokenizer('addition')
+  tokenizer = get_tokenizer('addition_encoder_decoder')
 
   max_sequence_length = max_length*2+1+2  # the max length of two operands, plus the '+' operator, plus SOS and EOS tokens
 
@@ -144,18 +183,80 @@ def generate_addition_data(
     json.dump(max_sequence_length, file)
 
 
-def load_data(task: str) -> tuple[jax.Array, jax.Array]:
+def generate_addition_decoder_only_data(
+    min_length=1,
+    max_length=5,  # max length of operand
+    n_samples=5e4,
+):
+  data_path = 'data/addition_decoder_only'
+  if not os.path.exists(data_path):
+    os.mkdir(data_path)
+
+  tokenizer = get_tokenizer('addition_decoder_only')
+
+  max_prompt_length = max_length*2+1  # the max length of two operands, plus the '+' operator
+  max_sequence_length = max_prompt_length*2+3 # prompt and response strings, plus SOS, EOS and SEP tokens
+
+  input_sequences: list[str] = []
+  tokenized_sequences: list[list[int]] = []
+  for _ in tqdm.tqdm(range(int(n_samples)), desc='Generating addition data'):
+    length_1 = random.randint(min_length, max_length)
+    length_2 = random.randint(min_length, max_length)
+    allow_leading_zero_1 = (length_1==1)  # can generate a single digit 0
+    allow_leading_zero_2 = (length_2==1)
+
+    if random.randint(0, 1):  # no carry chaining
+      input_sequence_1 = _generate_number(length_1, allow_leading_zero_1)
+      input_sequence_2 = _generate_number(length_2, allow_leading_zero_2)
+    else:  # yes carry chaining
+      carry_chain_length_1 = random.randint(min(2, length_1), length_1)  # anything less than length 2 is not a chain
+      carry_chain_length_2 = random.randint(min(2, length_2), length_2)
+      mode = random.randint(0, 2)
+      match mode:
+        case 0:  # only first sequence explicitly has carry chains
+          input_sequence_1 = _generate_carry_chain_number(length_1, carry_chain_length_1)
+          input_sequence_2 = _generate_number(length_2, allow_leading_zero_2)
+        case 1:  # only second sequence explicitly has carry chains
+          input_sequence_1 = _generate_number(length_1, allow_leading_zero_1)
+          input_sequence_2 = _generate_carry_chain_number(length_2, carry_chain_length_2)
+        case 2:  # both sequences explicitly have carry chains
+          input_sequence_1 = _generate_carry_chain_number(length_1, carry_chain_length_1)
+          input_sequence_2 = _generate_carry_chain_number(length_2, carry_chain_length_2)
+        case _:
+          raise ValueError()
+
+    input_sequence = f'{input_sequence_1}+{input_sequence_2}'
+    target_sequence = f'{str(int(input_sequence_1)+int(input_sequence_2))}'
+    input_sequence = f'{tokenizer.SOS}{input_sequence}{tokenizer.SEP}{target_sequence}{tokenizer.EOS}'
+    input_sequence += (max_sequence_length - len(input_sequence)) * tokenizer.PAD
+
+    input_sequences.append(input_sequence)
+    tokenized_sequences.append(tokenizer.encode(input_sequence))
+
+  with open(f'{data_path}/input.json', 'w') as file:
+    json.dump(input_sequences, file, indent=2)
+  np.save(f'{data_path}/tokenized_input.npy', np.array(tokenized_sequences, dtype=np.int16))
+  with open(f'{data_path}/vocab_size.json', 'w') as file:
+    json.dump(tokenizer.VOCAB_SIZE, file)
+  with open(f'{data_path}/max_sequence_length.json', 'w') as file:
+    json.dump(max_sequence_length, file)
+
+
+def load_data(task: str) -> tuple[jax.Array, jax.Array | None]:
   # with open(f'data/{task}/input.json', 'w') as file:
   #   json.dump(words, file, indent=2)
   # with open(f'data/{task}/target.json', 'w') as file:
   #   json.dump(reverse_words, file, indent=2)
-  input_data = np.load(f'data/{task}/tokenized_input.npy')
-  target_data = np.load(f'data/{task}/tokenized_target.npy')
+  input_data = jnp.array(np.load(f'data/{task}/tokenized_input.npy'))
+  if os.path.exists(f'data/{task}/tokenized_target.npy'):
+    target_data = jnp.array(np.load(f'data/{task}/tokenized_target.npy'))
+  else:
+    target_data = None
   # with open(f'data/{task}/vocab_size.json', 'w') as file:
   #   vocab_size = json.load(StringReverseTokenizer.VOCAB_SIZE, file)
   # with open(f'data/{task}/max_sequence_length.json', 'w') as file:
   #   max_sequence_length = json.dump(max_length, file)
-  return jnp.array(input_data), jnp.array(target_data)  # (batch, sequence)
+  return input_data, target_data  # (batch, sequence)
 
 
 def compute_dataset_entropy(target_data: jax.Array, pad_token: int) -> tuple[float, float]:
@@ -195,8 +296,12 @@ def compute_dataset_entropy(target_data: jax.Array, pad_token: int) -> tuple[flo
 
 
 if __name__ == '__main__':
-  # generate_string_reverse_data()
-  generate_addition_data()
+  # generate_string_reverse_encoder_decoder_data()
+  # generate_string_reverse_decoder_only_data()
+  # generate_addition_encoder_decoder_data()
+  # generate_addition_decoder_only_data()
+
+  pass
 
 
 # TODO: add other tasks
